@@ -25,7 +25,7 @@ sudo ./telemt-installer.sh
 
 Минимальный набор:
 
-* `server.port` (по умолчанию `2443`)
+* `server.port` (по умолчанию `443`)
 * `announce_ip` (внешний IP сервера)
 * `tls_domain` (домен faketls для маскировки)
 * включать ли метрики (если да — `metrics_port` и `metrics_whitelist`)
