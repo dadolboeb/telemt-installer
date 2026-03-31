@@ -11,7 +11,8 @@ SERVICE_PATH="/etc/systemd/system/telemt.service"
 
 SERVICE_USER="telemt"
 SERVICE_GROUP="telemt"
-WORK_DIR="/var/lib/telemt"
+PANEL_USER="telemt-panel"
+WORK_DIR="/opt/telemt"
 
 log(){ echo -e "\n[telemt-installer] $*\n"; }
 warn(){ echo -e "\n[telemt-installer][WARN] $*\n" >&2; }
@@ -81,31 +82,7 @@ get_latest_asset_url(){
   echo "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download/${file}"
 }
 
-download_and_install_binary(){
-  log "Скачиваю последний релиз telemt..."
-  local url tmp version extracted
-
-  version="$(get_latest_release_tag)"
-  url="$(get_latest_asset_url)"
-
-  log "Последний релиз: ${version}"
-  log "Ассет: ${url}"
-
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
-
-  curl -fL "$url" -o "$tmp/telemt.tar.gz"
-  mkdir -p "$tmp/unpack"
-
-  tar -xzf "$tmp/telemt.tar.gz" -C "$tmp/unpack"
-  extracted="$(find "$tmp/unpack" -type f -name "telemt" | head -n1 || true)"
-  [[ -n "$extracted" ]] || die "Не нашёл бинарь telemt внутри архива"
-
-  install -m 0755 "$extracted" "$BIN_PATH"
-  log "Бинарь установлен: $BIN_PATH"
-}
-
-ensure_service_user(){
+ensure_system_user(){
   if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
     groupadd --system "$SERVICE_GROUP"
   fi
@@ -121,13 +98,46 @@ ensure_service_user(){
   fi
 
   mkdir -p "$WORK_DIR"
-  chown "$SERVICE_USER:$SERVICE_GROUP" "$WORK_DIR"
+  chown -R "$SERVICE_USER:$SERVICE_GROUP" "$WORK_DIR"
   chmod 0750 "$WORK_DIR"
 }
 
+ensure_panel_access(){
+  if id -u "$PANEL_USER" >/dev/null 2>&1; then
+    usermod -aG "$SERVICE_GROUP" "$PANEL_USER" || true
+    log "Пользователь ${PANEL_USER} добавлен в группу ${SERVICE_GROUP}"
+  else
+    warn "Пользователь ${PANEL_USER} не найден. Если поставишь telemt_panel позже, добавь его в группу ${SERVICE_GROUP}"
+  fi
+}
+
+download_and_install_binary(){
+  log "Скачиваю последний релиз telemt..."
+  local url tmp version extracted
+
+  version="$(get_latest_release_tag)"
+  url="$(get_latest_asset_url)"
+
+  log "Последний релиз: ${version}"
+  log "Ассет: ${url}"
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+
+  curl -fL "$url" -o "$tmp/telemt.tar.gz"
+  mkdir -p "$tmp/unpack"
+  tar -xzf "$tmp/telemt.tar.gz" -C "$tmp/unpack"
+
+  extracted="$(find "$tmp/unpack" -type f -name "telemt" | head -n1 || true)"
+  [[ -n "$extracted" ]] || die "Не найден бинарь telemt внутри архива"
+
+  install -m 0755 "$extracted" "$BIN_PATH"
+  log "Бинарь установлен: $BIN_PATH"
+}
+
 gen_user_secret_line(){
-  local username key
-  username="${1:-tgproxy}"
+  local username="${1:-tgproxy}"
+  local key
   key="$(openssl rand -hex 16)"
   echo "\"${username}\" = \"${key}\""
 }
@@ -141,39 +151,52 @@ PY
 }
 
 write_config(){
-  log "Создаю конфиг..."
+  log "Создаю актуальный конфиг..."
 
   mkdir -p "$CONF_DIR"
-  chown root:"$SERVICE_GROUP" "$CONF_DIR"
-  chmod 0750 "$CONF_DIR"
 
   local port announce_ip tls_domain username user_line
   local enable_metrics metrics_mode metrics_port metrics_listen metrics_whitelist_csv metrics_whitelist_arr
   local enable_api api_listen api_whitelist_csv api_whitelist_arr api_auth_header api_read_only
   local enable_timing_norm timing_floor timing_ceil
   local enable_aggressive_shape
+  local use_middle_proxy
+  local prefer_ipv6
+  local log_level
 
   port="$(ask "server.port" "443")"
 
-  announce_ip="$(ask "announce_ip (внешний IPv4/домен для tg:// ссылки)" "")"
+  announce_ip="$(ask "announce_ip (внешний IP или домен сервера)" "")"
   [[ -n "$announce_ip" ]] || die "announce_ip обязателен"
 
-  tls_domain="$(ask "tls_domain (домен faketls/masking)" "")"
+  tls_domain="$(ask "tls_domain (домен для faketls/masking)" "")"
   [[ -n "$tls_domain" ]] || die "tls_domain обязателен"
 
-  username="$(ask "Имя пользователя в [access.users]" "tgproxy")"
+  username="$(ask "Имя пользователя в access.users" "tgproxy")"
   user_line="$(gen_user_secret_line "$username")"
 
+  use_middle_proxy="false"
+  if confirm "Включить use_middle_proxy?" "n"; then
+    use_middle_proxy="true"
+  fi
+
+  prefer_ipv6="false"
+  if confirm "Предпочитать IPv6 при исходящих соединениях?" "n"; then
+    prefer_ipv6="true"
+  fi
+
+  log_level="$(ask "general.log_level" "normal")"
+
   enable_metrics="false"
-  metrics_mode="port"
+  metrics_mode="listen"
   metrics_port="9090"
   metrics_listen="127.0.0.1:9090"
   metrics_whitelist_csv="127.0.0.1/32,::1/128"
   metrics_whitelist_arr='"127.0.0.1/32", "::1/128"'
 
-  if confirm "Включить Prometheus metrics endpoint?" "n"; then
+  if confirm "Включить metrics endpoint?" "n"; then
     enable_metrics="true"
-    if confirm "Задать metrics через metrics_listen вместо metrics_port?" "y"; then
+    if confirm "Использовать metrics_listen вместо metrics_port?" "y"; then
       metrics_mode="listen"
       metrics_listen="$(ask "metrics_listen" "127.0.0.1:9090")"
     else
@@ -185,14 +208,14 @@ write_config(){
   fi
 
   enable_api="true"
-  api_listen="$(ask "API listen" "127.0.0.1:9091")"
-  api_whitelist_csv="$(ask "API whitelist CIDR (через запятую)" "127.0.0.1/32,::1/128")"
+  api_listen="$(ask "server.api.listen" "127.0.0.1:9091")"
+  api_whitelist_csv="$(ask "server.api.whitelist CIDR (через запятую)" "127.0.0.1/32,::1/128")"
   api_whitelist_arr="$(csv_to_toml_array "$api_whitelist_csv")"
 
   api_auth_header=""
   if confirm "Защитить API Authorization header?" "n"; then
-    api_auth_header="$(ask "Точное значение Authorization header (например: Bearer supersecret)" "")"
-    [[ -n "$api_auth_header" ]] || die "auth_header не может быть пустым, если защита API включена"
+    api_auth_header="$(ask "Authorization header (пример: Bearer supersecret)" "")"
+    [[ -n "$api_auth_header" ]] || die "Authorization header не может быть пустым"
   fi
 
   api_read_only="false"
@@ -218,8 +241,9 @@ write_config(){
 # telemt.toml generated by installer
 
 [general]
-use_middle_proxy = false
-log_level = "normal"
+prefer_ipv6 = ${prefer_ipv6}
+use_middle_proxy = ${use_middle_proxy}
+log_level = "${log_level}"
 
 [general.modes]
 classic = false
@@ -236,6 +260,7 @@ port = ${port}
 listen_addr_ipv4 = "0.0.0.0"
 listen_addr_ipv6 = "::"
 proxy_protocol = false
+# proxy_protocol_trusted_cidrs = ["127.0.0.1/32", "::1/128"]
 EOF
 
   if [[ "$enable_metrics" == "true" ]]; then
@@ -306,13 +331,13 @@ fake_cert_len = 2048
 tls_emulation = true
 tls_front_dir = "tlsfront"
 
-# Recommended current defaults / conservative hardening
 mask_shape_hardening = true
 mask_shape_hardening_aggressive_mode = ${enable_aggressive_shape}
 mask_shape_bucket_floor_bytes = 512
 mask_shape_bucket_cap_bytes = 4096
 mask_shape_above_cap_blur = false
 mask_shape_above_cap_blur_max_bytes = 512
+
 mask_timing_normalization_enabled = ${enable_timing_norm}
 mask_timing_normalization_floor_ms = ${timing_floor}
 mask_timing_normalization_ceiling_ms = ${timing_ceil}
@@ -327,16 +352,22 @@ ${user_line}
 [[upstreams]]
 type = "direct"
 enabled = true
-weight = 10
-scopes = "*"
+weight = 1
 EOF
 
-  chown root:"$SERVICE_GROUP" "$CONF_PATH"
-  chmod 0640 "$CONF_PATH"
+  chown -R "$SERVICE_USER:$SERVICE_GROUP" "$CONF_DIR"
+  chmod 0770 "$CONF_DIR"
+  chmod 0660 "$CONF_PATH"
 
   log "Конфиг записан: $CONF_PATH"
-  log "Секрет пользователя (сохрани себе):"
+  log "Секрет пользователя:"
   echo "  ${user_line}"
+}
+
+ensure_tlsfront_dir(){
+  mkdir -p "${WORK_DIR}/tlsfront"
+  chown -R "$SERVICE_USER:$SERVICE_GROUP" "${WORK_DIR}/tlsfront"
+  chmod 0750 "${WORK_DIR}/tlsfront"
 }
 
 write_systemd(){
@@ -368,8 +399,7 @@ EOF
   chmod 0644 "$SERVICE_PATH"
   systemctl daemon-reload
   systemctl enable --now telemt
-
-  log "Сервис запущен."
+  log "Сервис запущен"
 }
 
 print_links_from_api(){
@@ -379,78 +409,75 @@ print_links_from_api(){
   api_url="http://127.0.0.1:9091/v1/users"
   auth_header="$(grep -E '^[[:space:]]*auth_header[[:space:]]*=' "$CONF_PATH" 2>/dev/null | sed -E 's/^[^"]*"([^"]+)".*/\1/' || true)"
 
-  for i in {1..30}; do
+  for i in {1..20}; do
     if [[ -n "$auth_header" ]]; then
-      if need_cmd jq; then
-        if curl -fsS -H "Authorization: ${auth_header}" "$api_url" 2>/dev/null \
-          | jq -er '.data[] | "User: \(.username)\n\(.links.tls[0] // empty)\n"' >/tmp/telemt-links.$$ 2>/dev/null; then
-          echo
-          echo "================= TELEMT PROXY LINKS ================="
-          cat /tmp/telemt-links.$$
-          echo "======================================================"
-          echo
-          rm -f /tmp/telemt-links.$$
-          return 0
-        fi
-      else
-        if curl -fsS -H "Authorization: ${auth_header}" "$api_url" >/tmp/telemt-users.$$.json 2>/dev/null; then
-          echo
-          echo "API ответ:"
-          cat /tmp/telemt-users.$$.json
-          echo
-          rm -f /tmp/telemt-users.$$.json
-          return 0
-        fi
+      if curl -fsS -H "Authorization: ${auth_header}" "$api_url" >/tmp/telemt-users.$$ 2>/dev/null; then
+        echo
+        echo "================= TELEMT USERS API ================="
+        cat /tmp/telemt-users.$$
+        echo
+        echo "===================================================="
+        echo
+        rm -f /tmp/telemt-users.$$
+        return 0
       fi
     else
-      if need_cmd jq; then
-        if curl -fsS "$api_url" 2>/dev/null \
-          | jq -er '.data[] | "User: \(.username)\n\(.links.tls[0] // empty)\n"' >/tmp/telemt-links.$$ 2>/dev/null; then
-          echo
-          echo "================= TELEMT PROXY LINKS ================="
-          cat /tmp/telemt-links.$$
-          echo "======================================================"
-          echo
-          rm -f /tmp/telemt-links.$$
-          return 0
-        fi
-      else
-        if curl -fsS "$api_url" >/tmp/telemt-users.$$.json 2>/dev/null; then
-          echo
-          echo "API ответ:"
-          cat /tmp/telemt-users.$$.json
-          echo
-          rm -f /tmp/telemt-users.$$.json
-          return 0
-        fi
+      if curl -fsS "$api_url" >/tmp/telemt-users.$$ 2>/dev/null; then
+        echo
+        echo "================= TELEMT USERS API ================="
+        cat /tmp/telemt-users.$$
+        echo
+        echo "===================================================="
+        echo
+        rm -f /tmp/telemt-users.$$
+        return 0
       fi
     fi
     sleep 1
   done
 
-  warn "Не удалось получить ссылки через API за 30 секунд."
+  warn "Не удалось получить API-ответ."
   warn "Проверь вручную:"
   if [[ -n "$auth_header" ]]; then
     warn "curl -H 'Authorization: ${auth_header}' ${api_url}"
   else
     warn "curl ${api_url}"
   fi
-  return 1
+}
+
+post_checks(){
+  echo
+  echo "Полезные проверки:"
+  echo "  systemctl status telemt --no-pager"
+  echo "  journalctl -u telemt -n 100 --no-pager"
+  echo "  ls -ld ${CONF_DIR}"
+  echo "  ls -l ${CONF_PATH}"
+  echo "  id ${SERVICE_USER}"
+  if id -u "$PANEL_USER" >/dev/null 2>&1; then
+    echo "  id ${PANEL_USER}"
+  fi
+  echo
+
+  warn "Если в логах будет 'No upstreams available', проверь, что в конфиге нет scopes='*' у default upstream."
+  warn "Если будет 'Connection timeout to 149.154.x.x:443', это уже сетевая проблема VPS/outbound, а не формат конфига."
 }
 
 main(){
   need_root
 
-  if ! need_cmd curl || ! need_cmd python3 || ! need_cmd openssl || ! need_cmd tar || ! need_cmd jq; then
-    log "Ставлю зависимости (curl, python3, openssl, tar, jq, ca-certificates)..."
-    apt_install curl python3 openssl tar jq ca-certificates
+  if ! need_cmd curl || ! need_cmd python3 || ! need_cmd openssl || ! need_cmd tar || ! need_cmd ca-certificates; then
+    log "Ставлю зависимости..."
+    apt_install curl python3 openssl tar ca-certificates
   fi
 
-  ensure_service_user
+  ensure_system_user
+  ensure_panel_access
   download_and_install_binary
   write_config
+  ensure_tlsfront_dir
   write_systemd
   print_links_from_api || true
+  post_checks
 
   log "Готово."
 }
